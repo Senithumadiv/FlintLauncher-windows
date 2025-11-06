@@ -1,6 +1,33 @@
 [package]
 name = "FlintLauncher-windows"
-version = "0.1.0"
-edition = "2024"
+version = "1.0.0"
+edition = "2021"
+description = "Lightning fast application launcher for Windows"
+authors = ["Senithumadiv <seni200712345@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/Senithumadiv/FlintLauncher-windows"
+readme = "README.md"
+
+[[bin]]
+name = "flint"
+path = "src/main.rs"
 
 [dependencies]
+eframe = "0.27"
+egui = "0.27"
+fuzzy-matcher = "0.3"
+rayon = "1.8"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+urlencoding = "2.1"
+meval = "0.3"
+emojis = "0.8"
+dirs = "5.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
+strip = true
