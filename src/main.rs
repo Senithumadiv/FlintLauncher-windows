@@ -1,4 +1,52 @@
-use eframe::egui;
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = if args.len() > 1 && args[1] == "settings" {
+        AppMode::Settings
+    } else {
+        AppMode::Launcher
+    };
+
+    let app = match FlintApp::new() {
+        Ok(mut app) => {
+            app.app_mode = mode;
+            app
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    
+    let (title, width, height) = if mode == AppMode::Settings {
+        ("Flint Settings", 550.0, 600.0)
+    } else {
+        ("Flint", 600.0, 50.0)
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([width, height])
+            .with_decorations(mode == AppMode::Settings)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_position(egui::pos2(
+                (1920.0 - width) / 2.0,
+                200.0,
+            )),
+        centered: false,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        title,
+        options,
+        Box::new(move |cc| {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            Box::new(app)
+        }),
+    )
+}use eframe::egui;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use rayon::prelude::*;
@@ -9,7 +57,75 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 use dirs;
+
+#[derive(Clone, Debug)]
+struct HotkeyConfig {
+    launcher_key: String,
+    settings_key: String,
+    enabled: bool,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            launcher_key: "Alt+Space".to_string(),
+            settings_key: "Alt+Shift+S".to_string(),
+            enabled: true,
+        }
+    }
+}
+
+impl HotkeyConfig {
+    fn load() -> Self {
+        let config_path = get_config_dir().join("hotkeys.conf");
+        
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            let mut config = Self::default();
+            for line in content.lines() {
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if line.starts_with("launcher_key=") {
+                    config.launcher_key = line.replace("launcher_key=", "").trim().to_string();
+                } else if line.starts_with("settings_key=") {
+                    config.settings_key = line.replace("settings_key=", "").trim().to_string();
+                } else if line.starts_with("enabled=") {
+                    config.enabled = line.replace("enabled=", "").trim() == "true";
+                }
+            }
+            config
+        } else {
+            Self::default()
+        }
+    }
+    
+    fn save(&self) {
+        let config_dir = get_config_dir();
+        let _ = fs::create_dir_all(&config_dir);
+        
+        let content = format!(
+            "# Flint Launcher Hotkey Configuration\n\
+             # Format: Key+Modifier (e.g., Space+Alt, C+Ctrl+Shift)\n\
+             # Supported modifiers: Ctrl, Alt, Shift, Super/Win, Cmd\n\n\
+             launcher_key={}\n\
+             settings_key={}\n\
+             enabled={}\n",
+            self.launcher_key,
+            self.settings_key,
+            self.enabled
+        );
+        
+        let _ = fs::write(config_dir.join("hotkeys.conf"), content);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AppMode {
+    Launcher,
+    Settings,
+}
 
 struct Theme {
     background: String,
@@ -115,6 +231,7 @@ enum ResultType {
 #[derive(Clone)]
 struct AppEntry {
     name: String,
+    #[allow(dead_code)]
     desktop_id: String,
     exec_command: String,
     match_indices: Vec<usize>,
@@ -166,12 +283,20 @@ struct FlintApp {
     window_animation: AnimationState,
     result_animations: Vec<AnimationState>,
     runtime: tokio::runtime::Runtime,
+    app_mode: AppMode,
+    hotkey_config: Arc<Mutex<HotkeyConfig>>,
+    temp_launcher_key: String,
+    temp_settings_key: String,
+    temp_enabled: bool,
+    status_message: String,
+    status_color: egui::Color32,
+    message_time: Instant,
 }
 
 impl FlintApp {
     fn new() -> Result<Self, String> {
         let lock_file = acquire_lock()?;
-        let items = scan_windows_apps();
+        let items = scan_apps();
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create async runtime: {}", e))?;
         
@@ -187,6 +312,14 @@ impl FlintApp {
             window_animation: AnimationState::new(Duration::from_millis(300), AnimationType::FadeIn),
             result_animations: Vec::new(),
             runtime,
+            app_mode: AppMode::Launcher,
+            hotkey_config: Arc::new(Mutex::new(HotkeyConfig::load())),
+            temp_launcher_key: String::new(),
+            temp_settings_key: String::new(),
+            temp_enabled: false,
+            status_message: String::new(),
+            status_color: egui::Color32::GREEN,
+            message_time: Instant::now(),
         })
     }
     
@@ -228,6 +361,16 @@ impl FlintApp {
 
 impl eframe::App for FlintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.app_mode == AppMode::Settings {
+            self.render_settings(ctx);
+        } else {
+            self.render_launcher(ctx);
+        }
+    }
+}
+
+impl FlintApp {
+    fn render_launcher(&mut self, ctx: &egui::Context) {
         let _window_animating = self.window_animation.update();
         self.update_result_animations();
         
@@ -307,422 +450,408 @@ impl eframe::App for FlintApp {
                     color: egui::Color32::from_rgba_premultiplied(0, 0, 0, (50.0 * window_alpha) as u8),
                 }))
             .show(ctx, |ui| {
+                ui.set_min_width(window_width);
+                ui.set_max_width(window_width);
                 
-            ui.set_min_width(window_width);
-            ui.set_max_width(window_width);
-                
-            ui.vertical(|ui| {
-                let text_rgb = self.theme.hex_to_rgb(&self.theme.text_color);
-                
-                ui.add_space(5.0);
-                ui.add_space(5.0);
-                
-                let search_text_color = egui::Color32::from_rgba_premultiplied(
-                    (text_rgb[0] * 255.0 * window_alpha) as u8,
-                    (text_rgb[1] * 255.0 * window_alpha) as u8,
-                    (text_rgb[2] * 255.0 * window_alpha) as u8,
-                    (window_alpha * 255.0) as u8,
-                );
-                
-                ui.horizontal(|ui| {
-                    ui.add_space(15.0);
+                ui.vertical(|ui| {
+                    let text_rgb = self.theme.hex_to_rgb(&self.theme.text_color);
                     
-                    let response = ui.add_sized(
-                        [window_width - 30.0, 30.0],
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search...")
-                            .frame(false)
-                            .text_color(search_text_color)
-                            .font(egui::FontId::proportional(20.0))
-                            .id(egui::Id::new("search_field"))
-                    );
-
-                    if !self.has_focused {
-                        ui.ctx().memory_mut(|mem| mem.request_focus(response.id));
-                        self.has_focused = true;
-                    }
-                    
-                    ui.add_space(15.0);
-                });
-                
-                if !self.results.is_empty() {
                     ui.add_space(5.0);
-                    let separator_alpha = (window_alpha * 255.0) as u8;
-                    let border_rgb = self.theme.hex_to_rgb(&self.theme.border_color);
-                    let separator_color = egui::Color32::from_rgba_premultiplied(
-                        (border_rgb[0] * 255.0) as u8,
-                        (border_rgb[1] * 255.0) as u8,
-                        (border_rgb[2] * 255.0) as u8,
-                        separator_alpha
+                    ui.add_space(5.0);
+                    
+                    let search_text_color = egui::Color32::from_rgba_premultiplied(
+                        (text_rgb[0] * 255.0 * window_alpha) as u8,
+                        (text_rgb[1] * 255.0 * window_alpha) as u8,
+                        (text_rgb[2] * 255.0 * window_alpha) as u8,
+                        (window_alpha * 255.0) as u8,
                     );
                     
-                    let separator_height = 1.0;
-                    let available_width = ui.available_width();
-                    let separator_rect = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(available_width, separator_height)
-                    );
-                    ui.painter().rect_filled(separator_rect, 0.0, separator_color);
+                    ui.horizontal(|ui| {
+                        ui.add_space(15.0);
+                        
+                        let response = ui.add_sized(
+                            [window_width - 30.0, 30.0],
+                            egui::TextEdit::singleline(&mut self.query)
+                                .hint_text("Search...")
+                                .frame(false)
+                                .text_color(search_text_color)
+                                .font(egui::FontId::proportional(20.0))
+                                .id(egui::Id::new("search_field"))
+                        );
+
+                        if !self.has_focused {
+                            ui.ctx().memory_mut(|mem| mem.request_focus(response.id));
+                            self.has_focused = true;
+                        }
+                        
+                        ui.add_space(15.0);
+                    });
                     
-                    ui.add_space(separator_height + 5.0);
-                }
-
-                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.should_close = true;
-                }
-
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !self.results.is_empty() {
-                    self.selected = (self.selected + 1) % self.results.len();
-                }
-
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !self.results.is_empty() {
-                    if self.selected == 0 {
-                        self.selected = self.results.len() - 1;
-                    } else {
-                        self.selected -= 1;
-                    }
-                }
-
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.results.is_empty() {
-                    if let Some(result) = self.results.get(self.selected) {
-                        match result {
-                            ResultType::App(app) => {
-                                launch_app(&app.exec_command);
-                                self.should_close = true;
-                            }
-                            ResultType::Calculator(result) => {
-                                copy_to_clipboard(result);
-                                self.should_close = true;
-                            }
-                            ResultType::Command(cmd) => {
-                                execute_command(cmd);
-                                self.should_close = true;
-                            }
-                            ResultType::WebSearch(query) => {
-                                open_web_search(query);
-                                self.should_close = true;
-                            }
-                            ResultType::Url(url) => {
-                                open_url(&url);
-                                self.should_close = true;
-                            }
-                            ResultType::File(path) => {
-                                open_file(&path);
-                                self.should_close = true;
-                            }
-                            ResultType::Emoji(_, emoji) => {
-                                copy_to_clipboard(&emoji);
-                                self.should_close = true;
-                            }
-                            ResultType::Currency(_, _, result) => {
-                                copy_to_clipboard(&result.to_string());
-                                self.should_close = true;
-                            }
-                        }
-                    }
-                }
-
-                self.results.clear();
-
-                if !self.query.is_empty() {
-                    if self.query.starts_with("file:") {
-                        let file_query = &self.query[5..].trim();
-                        if !file_query.is_empty() {
-                            let file_results = search_files(file_query);
-                            for path in file_results {
-                                self.results.push(ResultType::File(path));
-                            }
-                        } else {
-                            self.results.push(ResultType::Command("Search files...".to_string()));
-                        }
-                    }
-                    else if self.query.starts_with("e:") {
-                        let emoji_query = &self.query[2..].trim();
-                        if !emoji_query.is_empty() {
-                            let emoji_results = search_emojis(emoji_query);
-                            for (name, emoji) in emoji_results {
-                                self.results.push(ResultType::Emoji(name, emoji));
-                            }
-                        } else {
-                            self.results.push(ResultType::Command("Search emojis...".to_string()));
-                        }
-                    }
-                    else if let Some((from, to, result)) = self.runtime.block_on(convert_currency_online(&self.query)) {
-                        self.results.push(ResultType::Currency(from, to, result));
-                    }
-                    else if looks_like_url(&self.query) {
-                        let url = if self.query.contains("://") {
-                            self.query.clone()
-                        } else {
-                            format!("https://{}", self.query)
-                        };
-                        self.results.push(ResultType::Url(url));
-                    }
-                    else if is_calculation(&self.query) {
-                        let expr = self.query.trim();
-                        if !expr.is_empty() {
-                            match meval::eval_str(expr) {
-                                Ok(result) => {
-                                    self.results.push(ResultType::Calculator(result.to_string()));
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    else if self.query.starts_with('$') {
-                        let cmd = &self.query[1..].trim();
-                        if !cmd.is_empty() {
-                            self.results.push(ResultType::Command(cmd.to_string()));
-                        } else {
-                            self.results.push(ResultType::Command("Enter command...".to_string()));
-                        }
-                    }
-                    else if self.query.starts_with('@') {
-                        let search = &self.query[1..].trim();
-                        if !search.is_empty() {
-                            self.results.push(ResultType::WebSearch(search.to_string()));
-                        } else {
-                            self.results.push(ResultType::Command("Search the web...".to_string()));
-                        }
-                    }
-                    
-                    if self.results.is_empty() {
-                        let matcher = SkimMatcherV2::default();
-                        let query = self.query.clone();
+                    if !self.results.is_empty() {
+                        ui.add_space(5.0);
+                        let separator_alpha = (window_alpha * 255.0) as u8;
+                        let border_rgb = self.theme.hex_to_rgb(&self.theme.border_color);
+                        let separator_color = egui::Color32::from_rgba_premultiplied(
+                            (border_rgb[0] * 255.0) as u8,
+                            (border_rgb[1] * 255.0) as u8,
+                            (border_rgb[2] * 255.0) as u8,
+                            separator_alpha
+                        );
                         
-                        let mut scored_results: Vec<(i64, AppEntry)> = self
-                            .items
-                            .par_iter()
-                            .filter_map(|app| {
-                                if let Some((score, indices)) = matcher.fuzzy_indices(&app.name, &query) {
-                                    let mut app_with_match = app.clone();
-                                    app_with_match.match_indices = indices;
-                                    return Some((score + 100, app_with_match));
-                                }
-                                
-                                if let Some((score, _)) = matcher.fuzzy_indices(&app.exec_command, &query) {
-                                    let mut app_with_match = app.clone();
-                                    app_with_match.match_indices = Vec::new();
-                                    return Some((score, app_with_match));
-                                }
-                                
-                                None
-                            })
-                            .collect();
+                        let separator_height = 1.0;
+                        let available_width = ui.available_width();
+                        let separator_rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(available_width, separator_height)
+                        );
+                        ui.painter().rect_filled(separator_rect, 0.0, separator_color);
                         
-                        scored_results.sort_by(|a, b| b.0.cmp(&a.0));
-                        
-                        for (_, app) in scored_results.into_iter().take(max_visible_results) {
-                            self.results.push(ResultType::App(app));
+                        ui.add_space(separator_height + 5.0);
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.should_close = true;
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !self.results.is_empty() {
+                        self.selected = (self.selected + 1) % self.results.len();
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !self.results.is_empty() {
+                        if self.selected == 0 {
+                            self.selected = self.results.len() - 1;
+                        } else {
+                            self.selected -= 1;
+                        }
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.results.is_empty() {
+                        if let Some(result) = self.results.get(self.selected) {
+                            execute_result(result);
+                            self.should_close = true;
+                        }
+                    }
+
+                    self.results.clear();
+
+                    if !self.query.is_empty() {
+                        if self.query.starts_with("file:") {
+                            let file_query = &self.query[5..].trim();
+                            if !file_query.is_empty() {
+                                let file_results = search_files(file_query);
+                                for path in file_results {
+                                    self.results.push(ResultType::File(path));
+                                }
+                            } else {
+                                self.results.push(ResultType::Command("Search files...".to_string()));
+                            }
+                        }
+                        else if self.query.starts_with("e:") {
+                            let emoji_query = &self.query[2..].trim();
+                            if !emoji_query.is_empty() {
+                                let emoji_results = search_emojis(emoji_query);
+                                for (name, emoji) in emoji_results {
+                                    self.results.push(ResultType::Emoji(name, emoji));
+                                }
+                            } else {
+                                self.results.push(ResultType::Command("Search emojis...".to_string()));
+                            }
+                        }
+                        else if let Some((from, to, result)) = self.runtime.block_on(convert_currency_online(&self.query)) {
+                            self.results.push(ResultType::Currency(from, to, result));
+                        }
+                        else if looks_like_url(&self.query) {
+                            let url = if self.query.contains("://") {
+                                self.query.clone()
+                            } else {
+                                format!("https://{}", self.query)
+                            };
+                            self.results.push(ResultType::Url(url));
+                        }
+                        else if is_calculation(&self.query) {
+                            let expr = self.query.trim();
+                            if !expr.is_empty() {
+                                match meval::eval_str(expr) {
+                                    Ok(result) => {
+                                        self.results.push(ResultType::Calculator(result.to_string()));
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        else if self.query.starts_with('$') {
+                            let cmd = &self.query[1..].trim();
+                            if !cmd.is_empty() {
+                                self.results.push(ResultType::Command(cmd.to_string()));
+                            } else {
+                                self.results.push(ResultType::Command("Enter command...".to_string()));
+                            }
+                        }
+                        else if self.query.starts_with('@') {
+                            let search = &self.query[1..].trim();
+                            if !search.is_empty() {
+                                self.results.push(ResultType::WebSearch(search.to_string()));
+                            } else {
+                                self.results.push(ResultType::Command("Search the web...".to_string()));
+                            }
                         }
                         
                         if self.results.is_empty() {
-                            self.results.push(ResultType::WebSearch(query));
+                            let matcher = SkimMatcherV2::default();
+                            let query = self.query.clone();
+                            
+                            let mut scored_results: Vec<(i64, AppEntry)> = self
+                                .items
+                                .par_iter()
+                                .filter_map(|app| {
+                                    if let Some((score, indices)) = matcher.fuzzy_indices(&app.name, &query) {
+                                        let mut app_with_match = app.clone();
+                                        app_with_match.match_indices = indices;
+                                        return Some((score + 100, app_with_match));
+                                    }
+                                    
+                                    if let Some((score, _)) = matcher.fuzzy_indices(&app.exec_command, &query) {
+                                        let mut app_with_match = app.clone();
+                                        app_with_match.match_indices = Vec::new();
+                                        return Some((score, app_with_match));
+                                    }
+                                    
+                                    None
+                                })
+                                .collect();
+                            
+                            scored_results.sort_by(|a, b| b.0.cmp(&a.0));
+                            
+                            for (_, app) in scored_results.into_iter().take(max_visible_results) {
+                                self.results.push(ResultType::App(app));
+                            }
+                            
+                            if self.results.is_empty() {
+                                self.results.push(ResultType::WebSearch(query));
+                            }
+                        }
+                        
+                        if self.selected >= self.results.len() && !self.results.is_empty() {
+                            self.selected = 0;
                         }
                     }
-                    
-                    if self.selected >= self.results.len() && !self.results.is_empty() {
-                        self.selected = 0;
-                    }
-                }
 
-                if !self.results.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(result_item_height * max_visible_results as f32)
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            
-                            for (i, result) in self.results.iter().enumerate() {
-                                let is_selected = i == self.selected;
-                                let item_alpha = self.get_result_alpha(i);
-                                let item_offset = self.get_result_offset(i);
-                                
-                                let sel_bg_rgb = self.theme.hex_to_rgb(&self.theme.selection_bg);
-                                let text_rgb = self.theme.hex_to_rgb(&self.theme.text_color);
-                                let sel_text_rgb = self.theme.hex_to_rgb(&self.theme.selection_text);
-                                
-                                let item_bg = if is_selected {
-                                    egui::Color32::from_rgba_premultiplied(
-                                        (sel_bg_rgb[0] * 255.0 * item_alpha) as u8,
-                                        (sel_bg_rgb[1] * 255.0 * item_alpha) as u8,
-                                        (sel_bg_rgb[2] * 255.0 * item_alpha) as u8,
-                                        (item_alpha * 255.0) as u8,
-                                    )
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-                                
-                                ui.add_space(item_offset);
-                                
-                                let item_frame = egui::Frame::none()
-                                    .fill(item_bg)
-                                    .inner_margin(egui::Margin::symmetric(15.0, 8.0));
-                                
-                                let response = item_frame.show(ui, |ui| {
-                                    ui.set_min_height(result_item_height - 16.0);
-                                    ui.set_width(window_width);
+                    if !self.results.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .max_height(result_item_height * max_visible_results as f32)
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                            .show(ui, |ui| {
+                                for (i, result) in self.results.iter().enumerate() {
+                                    let is_selected = i == self.selected;
+                                    let item_alpha = self.get_result_alpha(i);
+                                    let item_offset = self.get_result_offset(i);
                                     
-                                    ui.horizontal(|ui| {
-                                        match result {
-                                            ResultType::App(app) => {
-                                                render_highlighted_text(
-                                                    ui,
-                                                    &app.name,
-                                                    &app.match_indices,
-                                                    is_selected,
-                                                    &self.theme,
-                                                    item_alpha,
-                                                );
-                                            }
-                                            ResultType::Calculator(res) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("🧮 {} = {}", self.query, res))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::Command(cmd) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("💻 {}", cmd))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::WebSearch(query) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("🔍 Search DuckDuckGo: {}", query))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::Url(url) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("🌐 Open: {}", url))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::File(path) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown");
-                                                let parent_dir = path.parent()
-                                                    .and_then(|p| p.file_name())
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or("");
-                                                ui.label(
-                                                    egui::RichText::new(format!("📄 {} ({})", file_name, parent_dir))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::Emoji(name, emoji) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("{} :{}", emoji, name))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                            ResultType::Currency(from, to, result) => {
-                                                let color = if is_selected { sel_text_rgb } else { text_rgb };
-                                                ui.label(
-                                                    egui::RichText::new(format!("💱 {} {} = {:.2} {} (Live)", self.query, from, result, to))
-                                                        .color(egui::Color32::from_rgba_premultiplied(
-                                                            (color[0] * 255.0 * item_alpha) as u8,
-                                                            (color[1] * 255.0 * item_alpha) as u8,
-                                                            (color[2] * 255.0 * item_alpha) as u8,
-                                                            (item_alpha * 255.0) as u8,
-                                                        ))
-                                                        .size(self.theme.font_size)
-                                                );
-                                            }
-                                        }
-                                    });
-                                }).response;
-                                
-                                if is_selected {
-                                    response.scroll_to_me(Some(egui::Align::Center));
-                                }
-                                
-                                if response.clicked() {
-                                    match result {
-                                        ResultType::App(app) => {
-                                            launch_app(&app.exec_command);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::Calculator(res) => {
-                                            copy_to_clipboard(res);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::Command(cmd) => {
-                                            execute_command(cmd);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::WebSearch(query) => {
-                                            open_web_search(query);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::Url(url) => {
-                                            open_url(&url);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::File(path) => {
-                                            open_file(&path);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::Emoji(_, emoji) => {
-                                            copy_to_clipboard(&emoji);
-                                            self.should_close = true;
-                                        }
-                                        ResultType::Currency(_, _, result) => {
-                                            copy_to_clipboard(&result.to_string());
-                                            self.should_close = true;
-                                        }
+                                    let sel_bg_rgb = self.theme.hex_to_rgb(&self.theme.selection_bg);
+                                    
+                                    let item_bg = if is_selected {
+                                        egui::Color32::from_rgba_premultiplied(
+                                            (sel_bg_rgb[0] * 255.0 * item_alpha) as u8,
+                                            (sel_bg_rgb[1] * 255.0 * item_alpha) as u8,
+                                            (sel_bg_rgb[2] * 255.0 * item_alpha) as u8,
+                                            (item_alpha * 255.0) as u8,
+                                        )
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    
+                                    ui.add_space(item_offset);
+                                    
+                                    let item_frame = egui::Frame::none()
+                                        .fill(item_bg)
+                                        .inner_margin(egui::Margin::symmetric(15.0, 8.0));
+                                    
+                                    let response = item_frame.show(ui, |ui| {
+                                        ui.set_min_height(result_item_height - 16.0);
+                                        ui.set_width(window_width);
+                                        
+                                        ui.horizontal(|ui| {
+                                            render_result_item(ui, result, is_selected, &self.theme, item_alpha, &self.query);
+                                        });
+                                    }).response;
+                                    
+                                    if is_selected {
+                                        response.scroll_to_me(Some(egui::Align::Center));
                                     }
+                                    
+                                    if response.clicked() {
+                                        execute_result(result);
+                                    }
+                                    
+                                    ui.add_space(-item_offset);
                                 }
-                                
-                                ui.add_space(-item_offset);
-                            }
-                        });
-                }
-            });
+                            });
+                    }
+                });
         });
 
         ctx.request_repaint();
+    }
+    
+    fn render_settings(&mut self, ctx: &egui::Context) {
+        let config = self.hotkey_config.lock().ok();
+        if let Some(cfg) = config {
+            self.temp_launcher_key = cfg.launcher_key.clone();
+            self.temp_settings_key = cfg.settings_key.clone();
+            self.temp_enabled = cfg.enabled;
+        }
+        
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("⚙️ Flint Launcher Settings");
+            ui.separator();
+            
+            ui.heading("⌨️ Hotkey Configuration");
+            
+            ui.label("Launcher Hotkey:");
+            ui.text_edit_singleline(&mut self.temp_launcher_key);
+            ui.label("Example: Alt+Space, Ctrl+`, Super+Shift+D");
+            
+            ui.separator();
+            
+            ui.label("Settings Hotkey:");
+            ui.text_edit_singleline(&mut self.temp_settings_key);
+            ui.label("Example: Alt+Shift+S");
+            
+            ui.separator();
+            
+            ui.checkbox(&mut self.temp_enabled, "Enable Hotkeys");
+            
+            ui.separator();
+            
+            if self.message_time.elapsed().as_secs() < 4 {
+                ui.colored_label(self.status_color, &self.status_message);
+            }
+            
+            ui.separator();
+            
+            ui.horizontal(|ui| {
+                if ui.button("💾 Save").clicked() {
+                    if let Ok(mut config) = self.hotkey_config.lock() {
+                        config.launcher_key = self.temp_launcher_key.clone();
+                        config.settings_key = self.temp_settings_key.clone();
+                        config.enabled = self.temp_enabled;
+                        config.save();
+                        
+                        self.status_message = "✓ Saved! Restart to apply.".to_string();
+                        self.status_color = egui::Color32::GREEN;
+                        self.message_time = Instant::now();
+                    }
+                }
+                
+                if ui.button("🔄 Reset").clicked() {
+                    let defaults = HotkeyConfig::default();
+                    self.temp_launcher_key = defaults.launcher_key.clone();
+                    self.temp_settings_key = defaults.settings_key.clone();
+                    self.temp_enabled = defaults.enabled;
+                    
+                    self.status_message = "Reset to defaults".to_string();
+                    self.status_color = egui::Color32::YELLOW;
+                    self.message_time = Instant::now();
+                }
+            });
+            
+            ui.separator();
+            if ui.button("Back to Launcher").clicked() {
+                self.app_mode = AppMode::Launcher;
+            }
+        });
+    }
+}
+
+fn render_result_item(
+    ui: &mut egui::Ui,
+    result: &ResultType,
+    is_selected: bool,
+    theme: &Theme,
+    item_alpha: f32,
+    query: &str,
+) {
+    let text_rgb = theme.hex_to_rgb(&theme.text_color);
+    let sel_text_rgb = theme.hex_to_rgb(&theme.selection_text);
+    
+    let color = if is_selected { sel_text_rgb } else { text_rgb };
+    let color_val = egui::Color32::from_rgba_premultiplied(
+        (color[0] * 255.0 * item_alpha) as u8,
+        (color[1] * 255.0 * item_alpha) as u8,
+        (color[2] * 255.0 * item_alpha) as u8,
+        (item_alpha * 255.0) as u8,
+    );
+    
+    match result {
+        ResultType::App(app) => {
+            render_highlighted_text(ui, &app.name, &app.match_indices, is_selected, theme, item_alpha);
+        }
+        ResultType::Calculator(res) => {
+            ui.label(
+                egui::RichText::new(format!("🧮 {} = {}", query, res))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::Command(cmd) => {
+            ui.label(
+                egui::RichText::new(format!("💻 {}", cmd))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::WebSearch(search_query) => {
+            ui.label(
+                egui::RichText::new(format!("🔍 Search DuckDuckGo: {}", search_query))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::Url(url) => {
+            ui.label(
+                egui::RichText::new(format!("🌐 Open: {}", url))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::File(path) => {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown");
+            let parent_dir = path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            ui.label(
+                egui::RichText::new(format!("📄 {} ({})", file_name, parent_dir))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::Emoji(name, emoji) => {
+            ui.label(
+                egui::RichText::new(format!("{} :{}", emoji, name))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+        ResultType::Currency(from, to, result) => {
+            ui.label(
+                egui::RichText::new(format!("💱 {} {} = {:.2} {} (Live)", query, from, result, to))
+                    .color(color_val)
+                    .size(theme.font_size)
+            );
+        }
+    }
+}
+
+fn execute_result(result: &ResultType) {
+    match result {
+        ResultType::App(app) => launch_app(&app.exec_command),
+        ResultType::Calculator(res) => copy_to_clipboard(res),
+        ResultType::Command(cmd) => execute_command(cmd),
+        ResultType::WebSearch(query) => open_web_search(query),
+        ResultType::Url(url) => open_url(url),
+        ResultType::File(path) => open_file(path),
+        ResultType::Emoji(_, emoji) => copy_to_clipboard(emoji),
+        ResultType::Currency(_, _, result) => copy_to_clipboard(&result.to_string()),
     }
 }
 
@@ -879,32 +1008,83 @@ async fn convert_currency_online(query: &str) -> Option<(String, String, f64)> {
     None
 }
 
+#[cfg(target_os = "windows")]
 fn copy_to_clipboard(text: &str) {
     let _ = Command::new("cmd")
-        .args(["/C", "echo", text, "|", "clip"])
+        .args(&["/C", &format!("echo {} | clip", text)])
         .spawn();
 }
 
+#[cfg(not(target_os = "windows"))]
+fn copy_to_clipboard(text: &str) {
+    let _ = Command::new("xclip")
+        .arg("-selection")
+        .arg("clipboard")
+        .arg("-i")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.as_mut().map(|stdin| {
+                let _ = stdin.write_all(text.as_bytes());
+            });
+            Ok(child)
+        });
+}
+
+#[cfg(target_os = "windows")]
 fn execute_command(cmd: &str) {
     let _ = Command::new("cmd")
-        .args(["/C", "start", "cmd", "/C", cmd])
+        .args(&["/C", "start", "cmd", "/C", cmd])
         .spawn();
 }
 
+#[cfg(not(target_os = "windows"))]
+fn execute_command(cmd: &str) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .spawn();
+}
+
+#[cfg(target_os = "windows")]
 fn open_web_search(query: &str) {
     let url = format!("https://duckduckgo.com/?q={}", urlencoding::encode(query));
     open_url(&url);
 }
 
-fn open_url(url: &str) {
-    let _ = Command::new("cmd")
-        .args(["/C", "start", "", url])
+#[cfg(not(target_os = "windows"))]
+fn open_web_search(query: &str) {
+    let url = format!("https://duckduckgo.com/?q={}", urlencoding::encode(query));
+    let _ = Command::new("xdg-open")
+        .arg(&url)
         .spawn();
 }
 
+#[cfg(target_os = "windows")]
+fn open_url(url: &str) {
+    let _ = Command::new("cmd")
+        .args(&["/C", "start", "", url])
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_url(url: &str) {
+    let _ = Command::new("xdg-open")
+        .arg(url)
+        .spawn();
+}
+
+#[cfg(target_os = "windows")]
 fn open_file(path: &PathBuf) {
     let _ = Command::new("cmd")
-        .args(["/C", "start", "", &path.to_string_lossy()])
+        .args(&["/C", "start", "", &path.to_string_lossy()])
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_file(path: &PathBuf) {
+    let _ = Command::new("xdg-open")
+        .arg(path)
         .spawn();
 }
 
@@ -917,7 +1097,7 @@ fn search_files(query: &str) -> Vec<PathBuf> {
         dirs::document_dir(),
         dirs::desktop_dir(),
         dirs::picture_dir(),
-        dirs::music_dir(),
+        dirs::audio_dir(),
         dirs::video_dir(),
     ];
     
@@ -1046,31 +1226,37 @@ fn get_lock_path() -> PathBuf {
     std::env::temp_dir().join("flint.lock")
 }
 
+#[cfg(target_os = "windows")]
 fn launch_app(exec_command: &str) {
     let _ = Command::new("cmd")
-        .args(["/C", "start", "", exec_command])
+        .args(&["/C", "start", "", exec_command])
         .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn launch_app(exec_command: &str) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(exec_command)
+        .spawn();
+}
+
+#[cfg(target_os = "windows")]
+fn scan_apps() -> Vec<AppEntry> {
+    scan_windows_apps()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn scan_apps() -> Vec<AppEntry> {
+    scan_linux_apps()
 }
 
 fn scan_windows_apps() -> Vec<AppEntry> {
     let mut apps = Vec::new();
 
-    // Scan Start Menu shortcuts
-    if let Some(start_menu) = dirs::start_menu_dir() {
-        scan_windows_shortcuts(&start_menu, &mut apps);
-    }
-    
-    if let Some(common_start_menu) = dirs::program_dir() {
-        let common_start = common_start_menu.join("Start Menu");
-        if common_start.exists() {
-            scan_windows_shortcuts(&common_start, &mut apps);
-        }
-    }
-
-    // Common Windows apps
     let common_apps = [
         ("Notepad", "notepad.exe"),
-        ("Calculator", "calc.exe"),
+        ("Calculator", "calc.exe"), 
         ("Paint", "mspaint.exe"),
         ("Command Prompt", "cmd.exe"),
         ("PowerShell", "powershell.exe"),
@@ -1094,7 +1280,6 @@ fn scan_windows_apps() -> Vec<AppEntry> {
         });
     }
 
-    // Scan program files
     let program_dirs = [
         std::env::var("PROGRAMFILES").unwrap_or_else(|_| "C:\\Program Files".to_string()),
         std::env::var("PROGRAMFILES(X86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string()),
@@ -1102,35 +1287,36 @@ fn scan_windows_apps() -> Vec<AppEntry> {
     ];
 
     for program_dir in &program_dirs {
-        if let Ok(entries) = fs::read_dir(program_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(folder_name) = path.file_name().and_then(|s| s.to_str()) {
-                        // Look for executables in the folder
-                        if let Ok(sub_entries) = fs::read_dir(&path) {
-                            for sub_entry in sub_entries.flatten() {
-                                let sub_path = sub_entry.path();
-                                if sub_path.extension().and_then(|e| e.to_str()) == Some("exe") {
-                                    if let Some(exe_name) = sub_path.file_stem().and_then(|s| s.to_str()) {
-                                        apps.push(AppEntry {
-                                            name: format!("{} - {}", folder_name, exe_name),
-                                            desktop_id: folder_name.to_string(),
-                                            exec_command: sub_path.to_string_lossy().to_string(),
-                                            match_indices: Vec::new(),
-                                        });
+        let program_path = PathBuf::from(program_dir);
+        if program_path.exists() {
+            if let Ok(entries) = fs::read_dir(&program_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(folder_name) = path.file_name().and_then(|s| s.to_str()) {
+                            if let Ok(sub_entries) = fs::read_dir(&path) {
+                                for sub_entry in sub_entries.flatten() {
+                                    let sub_path = sub_entry.path();
+                                    if sub_path.extension().and_then(|e| e.to_str()) == Some("exe") {
+                                        if let Some(exe_name) = sub_path.file_stem().and_then(|s| s.to_str()) {
+                                            apps.push(AppEntry {
+                                                name: format!("{} - {}", folder_name, exe_name),
+                                                desktop_id: folder_name.to_string(),
+                                                exec_command: sub_path.to_string_lossy().to_string(),
+                                                match_indices: Vec::new(),
+                                            });
+                                        }
                                     }
                                 }
                             }
+                            
+                            apps.push(AppEntry {
+                                name: folder_name.to_string(),
+                                desktop_id: folder_name.to_string(),
+                                exec_command: format!("explorer \"{}\"", path.display()),
+                                match_indices: Vec::new(),
+                            });
                         }
-                        
-                        // Also add the folder itself
-                        apps.push(AppEntry {
-                            name: folder_name.to_string(),
-                            desktop_id: folder_name.to_string(),
-                            exec_command: format!("explorer \"{}\"", path.display()),
-                            match_indices: Vec::new(),
-                        });
                     }
                 }
             }
@@ -1142,46 +1328,81 @@ fn scan_windows_apps() -> Vec<AppEntry> {
     apps
 }
 
-fn scan_windows_shortcuts(dir: &PathBuf, apps: &mut Vec<AppEntry>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                scan_windows_shortcuts(&path, apps);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("lnk") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    apps.push(AppEntry {
-                        name: stem.to_string(),
-                        desktop_id: stem.to_string(),
-                        exec_command: path.to_string_lossy().to_string(),
-                        match_indices: Vec::new(),
-                    });
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("exe") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    apps.push(AppEntry {
-                        name: stem.to_string(),
-                        desktop_id: stem.to_string(),
-                        exec_command: path.to_string_lossy().to_string(),
-                        match_indices: Vec::new(),
-                    });
+fn scan_linux_apps() -> Vec<AppEntry> {
+    let mut apps = Vec::new();
+    
+    // Add some common Linux applications
+    let common_apps = [
+        ("Firefox", "firefox"),
+        ("Terminal", "gnome-terminal"),
+        ("Files", "nautilus"),
+        ("Text Editor", "gedit"),
+        ("Calculator", "gnome-calculator"),
+        ("Settings", "gnome-control-center"),
+    ];
+    
+    for (name, exec) in common_apps {
+        apps.push(AppEntry {
+            name: name.to_string(),
+            desktop_id: name.to_string(),
+            exec_command: exec.to_string(),
+            match_indices: Vec::new(),
+        });
+    }
+    
+    // Try to scan .desktop files in common locations
+    let desktop_dirs = [
+        dirs::data_dir().map(|p| p.join("applications")),
+        Some(PathBuf::from("/usr/share/applications")),
+        Some(PathBuf::from("/usr/local/share/applications")),
+    ];
+    
+    for dir_option in &desktop_dirs {
+        if let Some(dir) = dir_option {
+            if dir.exists() {
+                if let Ok(entries) = fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("desktop") {
+                            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                                apps.push(AppEntry {
+                                    name: name.to_string(),
+                                    desktop_id: name.to_string(),
+                                    exec_command: path.to_string_lossy().to_string(),
+                                    match_indices: Vec::new(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+    
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    apps.dedup_by(|a, b| a.name == b.name);
+    apps
 }
 
+#[cfg(target_os = "windows")]
 fn get_config_dir() -> PathBuf {
     dirs::config_dir()
         .map(|p| p.join("Flint"))
         .unwrap_or_else(|| PathBuf::from("C:\\ProgramData\\Flint"))
 }
 
-fn create_default_theme(theme_path: &PathBuf) {
-    let default_theme = r#"# Flint Theme Configuration - Windows Dark Theme
-# Made By SenithuMadiv (https://github.com/Senithumadiv)
+#[cfg(not(target_os = "windows"))]
+fn get_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|p| p.join("flint"))
+        .unwrap_or_else(|| PathBuf::from("~/.config/flint"))
+}
 
-# Main window colors (Windows Dark Theme)
+fn create_default_theme(theme_path: &PathBuf) {
+    let default_theme = r#"# Flint Theme Configuration
+# Dark Theme
+
+# Main window colors
 background=#2d2d30
 text_color=#ffffff
 selection_bg=#0078d4
@@ -1193,7 +1414,7 @@ highlight_color=#0078d4
 font_size=16
 font_family=Segoe UI
 
-# Border radius (Windows typically uses square corners)
+# Border radius
 border_radius=2
 "#;
     
@@ -1201,38 +1422,4 @@ border_radius=2
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(theme_path, default_theme);
-}
-
-fn main() -> eframe::Result<()> {
-    let app = match FlintApp::new() {
-        Ok(app) => app,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
-    
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 50.0])
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_position(egui::pos2(
-                (1920.0 - 600.0) / 2.0,
-                200.0,
-            )),
-        centered: false,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Flint",
-        options,
-        Box::new(move |cc| {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            Box::new(app)
-        }),
-    )
 }
