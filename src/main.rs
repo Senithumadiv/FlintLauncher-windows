@@ -11,7 +11,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use dirs;
-use std::sync::mpsc;
 use std::thread;
 
 #[derive(Clone, Debug)]
@@ -79,7 +78,6 @@ impl HotkeyConfig {
 enum AppMode {
     Launcher,
     Settings,
-    Hidden,
 }
 
 struct Theme {
@@ -245,14 +243,56 @@ struct FlintApp {
     status_message: String,
     status_color: egui::Color32,
     message_time: Instant,
-    tray_sender: mpsc::Sender<TrayMessage>,
 }
 
-#[derive(Debug)]
-enum TrayMessage {
-    ShowLauncher,
-    ShowSettings,
-    Exit,
+fn start_tray_thread() {
+    thread::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            use tray_item::TrayItem;
+            
+            if let Ok(mut tray) = TrayItem::new("Flint Launcher", "") {
+                let _ = tray.add_label("Flint Launcher");
+                let _ = tray.inner_mut().add_separator();
+                
+                let _ = tray.add_menu_item("Show Launcher", || {
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        let _ = Command::new(exe_path).spawn();
+                    }
+                });
+                
+                let _ = tray.add_menu_item("Settings", || {
+                    if let Ok(exe_path) = std::env::current_exe() {
+                        let _ = Command::new(exe_path).arg("settings").spawn();
+                    }
+                });
+                
+                let _ = tray.inner_mut().add_separator();
+                
+                let _ = tray.add_menu_item("Open Config Folder", || {
+                    let config_dir = get_config_dir();
+                    let _ = open_file(&config_dir);
+                });
+                
+                let _ = tray.inner_mut().add_separator();
+                
+                let _ = tray.add_menu_item("Show Theme File", || {
+                    let theme_path = get_config_dir().join("theme.conf");
+                    let _ = open_file(&theme_path);
+                });
+                
+                let _ = tray.inner_mut().add_separator();
+                
+                let _ = tray.add_menu_item("Exit", || {
+                    std::process::exit(0);
+                });
+            }
+        }
+        
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
 }
 
 impl FlintApp {
@@ -261,10 +301,6 @@ impl FlintApp {
         let items = scan_apps();
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create async runtime: {}", e))?;
-        
-        let (tray_sender, tray_receiver) = mpsc::channel();
-        
-        start_tray_thread(tray_receiver);
         
         Ok(Self {
             query: String::new(),
@@ -286,7 +322,6 @@ impl FlintApp {
             status_message: String::new(),
             status_color: egui::Color32::GREEN,
             message_time: Instant::now(),
-            tray_sender,
         })
     }
     
@@ -324,30 +359,10 @@ impl FlintApp {
             .map(|anim| anim.ease_out())
             .unwrap_or(1.0)
     }
-    
-    fn handle_tray_messages(&mut self) {
-        if let Ok(message) = self.tray_sender.try_recv() {
-            match message {
-                TrayMessage::ShowLauncher => {
-                    self.app_mode = AppMode::Launcher;
-                    self.should_close = false;
-                }
-                TrayMessage::ShowSettings => {
-                    self.app_mode = AppMode::Settings;
-                    self.should_close = false;
-                }
-                TrayMessage::Exit => {
-                    self.should_close = true;
-                }
-            }
-        }
-    }
 }
 
 impl eframe::App for FlintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_tray_messages();
-        
         if self.should_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -356,56 +371,8 @@ impl eframe::App for FlintApp {
         match self.app_mode {
             AppMode::Settings => self.render_settings(ctx),
             AppMode::Launcher => self.render_launcher(ctx),
-            AppMode::Hidden => {
-                ctx.request_repaint_after(Duration::from_secs(1));
-            }
         }
     }
-}
-
-fn start_tray_thread(receiver: mpsc::Receiver<TrayMessage>) {
-    thread::spawn(move || {
-        #[cfg(target_os = "windows")]
-        {
-            use tray_item::TrayItem;
-            
-            let mut tray = TrayItem::new("Flint Launcher", "").unwrap();
-            
-            tray.add_label("Flint Launcher").unwrap();
-            tray.inner_mut().add_separator().unwrap();
-            
-            tray.add_menu_item("Show Launcher", || {
-                if let Ok(sender) = receiver.try_recv() {
-                    let _ = sender.send(TrayMessage::ShowLauncher);
-                }
-            }).unwrap();
-            
-            tray.add_menu_item("Settings", || {
-                if let Ok(sender) = receiver.try_recv() {
-                    let _ = sender.send(TrayMessage::ShowSettings);
-                }
-            }).unwrap();
-            
-            tray.inner_mut().add_separator().unwrap();
-            
-            tray.add_menu_item("Open Config Folder", || {
-                let config_dir = get_config_dir();
-                let _ = open_file(&config_dir);
-            }).unwrap();
-            
-            tray.inner_mut().add_separator().unwrap();
-            
-            tray.add_menu_item("Exit", || {
-                if let Ok(sender) = receiver.try_recv() {
-                    let _ = sender.send(TrayMessage::Exit);
-                }
-            }).unwrap();
-        }
-        
-        loop {
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
 }
 
 impl FlintApp {
@@ -761,6 +728,12 @@ impl FlintApp {
             
             ui.separator();
             
+            ui.heading("🎨 Theme Configuration");
+            ui.label(format!("Theme file location: {}", get_config_dir().join("theme.conf").display()));
+            ui.label("Edit this file to change colors, fonts, and appearance.");
+            
+            ui.separator();
+            
             if self.message_time.elapsed().as_secs() < 4 {
                 ui.colored_label(self.status_color, &self.status_message);
             }
@@ -768,20 +741,20 @@ impl FlintApp {
             ui.separator();
             
             ui.horizontal(|ui| {
-                if ui.button("💾 Save").clicked() {
+                if ui.button("💾 Save Hotkeys").clicked() {
                     if let Ok(mut config) = self.hotkey_config.lock() {
                         config.launcher_key = self.temp_launcher_key.clone();
                         config.settings_key = self.temp_settings_key.clone();
                         config.enabled = self.temp_enabled;
                         config.save();
                         
-                        self.status_message = "✓ Saved! Restart to apply.".to_string();
+                        self.status_message = "✓ Hotkeys saved! Restart to apply.".to_string();
                         self.status_color = egui::Color32::GREEN;
                         self.message_time = Instant::now();
                     }
                 }
                 
-                if ui.button("🔄 Reset").clicked() {
+                if ui.button("🔄 Reset Hotkeys").clicked() {
                     let defaults = HotkeyConfig::default();
                     self.temp_launcher_key = defaults.launcher_key.clone();
                     self.temp_settings_key = defaults.settings_key.clone();
@@ -790,6 +763,11 @@ impl FlintApp {
                     self.status_message = "Reset to defaults".to_string();
                     self.status_color = egui::Color32::YELLOW;
                     self.message_time = Instant::now();
+                }
+                
+                if ui.button("📁 Open Config Folder").clicked() {
+                    let config_dir = get_config_dir();
+                    let _ = open_file(&config_dir);
                 }
             });
             
@@ -1469,6 +1447,8 @@ fn main() -> eframe::Result<()> {
         println!("Flint Launcher running in system tray...");
         println!("Config location: {}", get_config_dir().display());
         println!("Right-click the tray icon to access options.");
+        
+        start_tray_thread();
         
         loop {
             thread::sleep(Duration::from_secs(10));
