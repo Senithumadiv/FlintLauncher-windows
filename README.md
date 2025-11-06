@@ -41,12 +41,6 @@ Flint Launcher - Quick Start Guide
    - Calculator: 2+2 (no prefix needed)
    - Currency: 100 USD to EUR
 
-📁 File Structure:
-%APPDATA%\Flint\
-├── theme.conf
-├── hotkeys.conf
-└── (log files)
-
 🛠️ Troubleshooting:
 - If Flint doesn't start, check if another instance is running
 - Run "StartFlint.bat" to start manually
