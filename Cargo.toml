@@ -15,9 +15,4 @@ urlencoding = "2.1.3"
 meval = "0.2.0"
 emojis = "0.8.0"
 dirs = "4.0.0"
-
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-opt-level = "z"
+tray-item = "0.7.0"

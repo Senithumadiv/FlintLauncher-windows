@@ -1,52 +1,4 @@
-fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let mode = if args.len() > 1 && args[1] == "settings" {
-        AppMode::Settings
-    } else {
-        AppMode::Launcher
-    };
-
-    let app = match FlintApp::new() {
-        Ok(mut app) => {
-            app.app_mode = mode;
-            app
-        }
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
-    
-    let (title, width, height) = if mode == AppMode::Settings {
-        ("Flint Settings", 550.0, 600.0)
-    } else {
-        ("Flint", 600.0, 50.0)
-    };
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([width, height])
-            .with_decorations(mode == AppMode::Settings)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_position(egui::pos2(
-                (1920.0 - width) / 2.0,
-                200.0,
-            )),
-        centered: false,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        title,
-        options,
-        Box::new(move |cc| {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            Box::new(app)
-        }),
-    )
-}use eframe::egui;
+use eframe::egui;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use rayon::prelude::*;
@@ -59,6 +11,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use dirs;
+use std::sync::mpsc;
+use std::thread;
 
 #[derive(Clone, Debug)]
 struct HotkeyConfig {
@@ -125,6 +79,7 @@ impl HotkeyConfig {
 enum AppMode {
     Launcher,
     Settings,
+    Hidden,
 }
 
 struct Theme {
@@ -231,7 +186,6 @@ enum ResultType {
 #[derive(Clone)]
 struct AppEntry {
     name: String,
-    #[allow(dead_code)]
     desktop_id: String,
     exec_command: String,
     match_indices: Vec<usize>,
@@ -291,6 +245,14 @@ struct FlintApp {
     status_message: String,
     status_color: egui::Color32,
     message_time: Instant,
+    tray_sender: mpsc::Sender<TrayMessage>,
+}
+
+#[derive(Debug)]
+enum TrayMessage {
+    ShowLauncher,
+    ShowSettings,
+    Exit,
 }
 
 impl FlintApp {
@@ -299,6 +261,10 @@ impl FlintApp {
         let items = scan_apps();
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create async runtime: {}", e))?;
+        
+        let (tray_sender, tray_receiver) = mpsc::channel();
+        
+        start_tray_thread(tray_receiver);
         
         Ok(Self {
             query: String::new(),
@@ -320,6 +286,7 @@ impl FlintApp {
             status_message: String::new(),
             status_color: egui::Color32::GREEN,
             message_time: Instant::now(),
+            tray_sender,
         })
     }
     
@@ -357,16 +324,88 @@ impl FlintApp {
             .map(|anim| anim.ease_out())
             .unwrap_or(1.0)
     }
+    
+    fn handle_tray_messages(&mut self) {
+        if let Ok(message) = self.tray_sender.try_recv() {
+            match message {
+                TrayMessage::ShowLauncher => {
+                    self.app_mode = AppMode::Launcher;
+                    self.should_close = false;
+                }
+                TrayMessage::ShowSettings => {
+                    self.app_mode = AppMode::Settings;
+                    self.should_close = false;
+                }
+                TrayMessage::Exit => {
+                    self.should_close = true;
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for FlintApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.app_mode == AppMode::Settings {
-            self.render_settings(ctx);
-        } else {
-            self.render_launcher(ctx);
+        self.handle_tray_messages();
+        
+        if self.should_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        
+        match self.app_mode {
+            AppMode::Settings => self.render_settings(ctx),
+            AppMode::Launcher => self.render_launcher(ctx),
+            AppMode::Hidden => {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
         }
     }
+}
+
+fn start_tray_thread(receiver: mpsc::Receiver<TrayMessage>) {
+    thread::spawn(move || {
+        #[cfg(target_os = "windows")]
+        {
+            use tray_item::TrayItem;
+            
+            let mut tray = TrayItem::new("Flint Launcher", "").unwrap();
+            
+            tray.add_label("Flint Launcher").unwrap();
+            tray.inner_mut().add_separator().unwrap();
+            
+            tray.add_menu_item("Show Launcher", || {
+                if let Ok(sender) = receiver.try_recv() {
+                    let _ = sender.send(TrayMessage::ShowLauncher);
+                }
+            }).unwrap();
+            
+            tray.add_menu_item("Settings", || {
+                if let Ok(sender) = receiver.try_recv() {
+                    let _ = sender.send(TrayMessage::ShowSettings);
+                }
+            }).unwrap();
+            
+            tray.inner_mut().add_separator().unwrap();
+            
+            tray.add_menu_item("Open Config Folder", || {
+                let config_dir = get_config_dir();
+                let _ = open_file(&config_dir);
+            }).unwrap();
+            
+            tray.inner_mut().add_separator().unwrap();
+            
+            tray.add_menu_item("Exit", || {
+                if let Ok(sender) = receiver.try_recv() {
+                    let _ = sender.send(TrayMessage::Exit);
+                }
+            }).unwrap();
+        }
+        
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
 }
 
 impl FlintApp {
@@ -1331,7 +1370,6 @@ fn scan_windows_apps() -> Vec<AppEntry> {
 fn scan_linux_apps() -> Vec<AppEntry> {
     let mut apps = Vec::new();
     
-    // Add some common Linux applications
     let common_apps = [
         ("Firefox", "firefox"),
         ("Terminal", "gnome-terminal"),
@@ -1350,7 +1388,6 @@ fn scan_linux_apps() -> Vec<AppEntry> {
         });
     }
     
-    // Try to scan .desktop files in common locations
     let desktop_dirs = [
         dirs::data_dir().map(|p| p.join("applications")),
         Some(PathBuf::from("/usr/share/applications")),
@@ -1422,4 +1459,66 @@ border_radius=2
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(theme_path, default_theme);
+}
+
+fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let run_in_tray = args.len() > 1 && args[1] == "--tray";
+    
+    if run_in_tray {
+        println!("Flint Launcher running in system tray...");
+        println!("Config location: {}", get_config_dir().display());
+        println!("Right-click the tray icon to access options.");
+        
+        loop {
+            thread::sleep(Duration::from_secs(10));
+        }
+    }
+    
+    let mode = if args.len() > 1 && args[1] == "settings" {
+        AppMode::Settings
+    } else {
+        AppMode::Launcher
+    };
+
+    let app = match FlintApp::new() {
+        Ok(mut app) => {
+            app.app_mode = mode;
+            app
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+    
+    let (title, width, height) = if mode == AppMode::Settings {
+        ("Flint Settings", 550.0, 600.0)
+    } else {
+        ("Flint", 600.0, 50.0)
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([width, height])
+            .with_decorations(mode == AppMode::Settings)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_window_level(egui::WindowLevel::AlwaysOnTop)
+            .with_position(egui::pos2(
+                (1920.0 - width) / 2.0,
+                200.0,
+            )),
+        centered: false,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        title,
+        options,
+        Box::new(move |cc| {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            Box::new(app)
+        }),
+    )
 }
