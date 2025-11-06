@@ -49,7 +49,7 @@ Flint Launcher - Quick Start Guide
 
 🎨 Theme Customization:
 Edit %APPDATA%\Flint\theme.conf to change colors and fonts:
-
+```conf
 background=#2d2d30
 text_color=#ffffff
 selection_bg=#0078d4
@@ -59,5 +59,5 @@ highlight_color=#0078d4
 font_size=16
 font_family=Segoe UI
 border_radius=2
-
+```
 Enjoy! 🚀
