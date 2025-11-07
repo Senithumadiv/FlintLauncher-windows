@@ -1,4 +1,4 @@
-Flint Launcher - Quick Start Guide
+Flint Launcher - Quick Start Guide (NOT WORKING)
 ==================================
 
 🎯 Features:
